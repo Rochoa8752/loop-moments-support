@@ -1,4 +1,6 @@
-# Fibsgiving 🦃
+# 8A Thanksgiving 🦃 (Baby Leo is the best!)
+
+_Codename: Fibsgiving._
 
 A draw-and-bluff family party game played on everyone's phone, whether they're at the table or far away.
 

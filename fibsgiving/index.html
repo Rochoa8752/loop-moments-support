@@ -6,8 +6,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#2a1630">
-<title>Fibsgiving</title>
-<meta name="description" content="A draw-and-bluff family party game for your phones.">
+<title>8A Thanksgiving</title>
+<meta name="description" content="8A Thanksgiving — a draw-and-bluff family party game. Baby Leo is the best!">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦃</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,6 +15,19 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div id="cams" class="cams hidden">
+  <div id="camTiles" class="cam-tiles"></div>
+  <div id="camCtl" class="cam-ctl"></div>
+</div>
+<div id="camAsk" class="sheet-wrap hidden"><div class="sheet">
+  <h3>📹 Live video with the family</h3>
+  <p class="tiny" style="color:var(--muted)">See each other's faces while you play. Mics start OFF so the table doesn't echo. Works best with up to ~6 cameras.</p>
+  <button class="btn green" data-cam="share">📷 Share my camera</button>
+  <button class="btn" data-cam="watch" style="margin-top:10px">👀 Just watch</button>
+  <button class="btn alt hidden" data-cam="off" style="margin-top:10px">⏹ Turn off video</button>
+  <button class="btn ghost" data-cam="cancel" style="margin-top:10px;color:var(--muted)">Cancel</button>
+</div></div>
+<div id="spot" class="spot hidden"><video playsinline autoplay muted></video><div class="spot-nm"></div><div class="tiny">tap to close</div></div>
 <div id="app"><div class="center-screen"><div class="big-emoji bob">🦃</div><p>Warming up the oven…</p></div></div>
 <div id="chat" class="chat hidden" role="dialog" aria-label="Family chat">
   <div class="chat-head"><b>💬 Family Chat</b><button id="chatClose" class="iconbtn" aria-label="Close chat">✕</button></div>

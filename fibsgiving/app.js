@@ -1,4 +1,4 @@
-/* Fibsgiving — a draw-and-bluff family party game.
+/* 8A Thanksgiving (built as "Fibsgiving") — a draw-and-bluff family party game.
  * Architecture: one Supabase row per room holds the game state (written only by the host's phone).
  * Players write their moves (drawings, fibs, votes…) into the `moves` table. Everyone listens via
  * Supabase Realtime. If the host's phone drops, the next online player takes over automatically. */
@@ -9,10 +9,12 @@ const SB_URL = 'https://gqqgzndsbegiapechhnd.supabase.co';
 const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdxcWd6bmRzYmVnaWFwZWNoaG5kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU2NzI2NjksImV4cCI6MjExMTI0ODY2OX0.crFFssUDHyzD3WSAJhNDfNQLXung2NmqaAYLQP9B1Q0';
 const sb = window.supabase.createClient(SB_URL, SB_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
-  realtime: { params: { eventsPerSecond: 20 } }
+  realtime: { params: { eventsPerSecond: 40 } }
 });
 
 const DECKS = window.DECKS;
+const GAME_NAME = '8A Thanksgiving';
+const GAME_TAG = 'Baby Leo is the best! 👶';
 const AVATARS = ['🦃','🥧','🌽','🍗','🍠','🥔','🍁','🧀','🍎','🦆','🐿️','🦉','🐻','🦊','🐶','🐱','🐸','🐷','🦄','🐔','🍩','🌮','👽','🤖'];
 const REACTS = ['😂','😍','🤯','👏','🦃','🔥','💀'];
 const ROUND_INFO = {
@@ -80,7 +82,13 @@ document.addEventListener('pointerdown', () => {
   try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); else if (actx.state === 'suspended') actx.resume(); } catch (e) {}
   wake();
 }, { passive: true });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wake(); if (room) refresh(); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    wake(); if (room) refresh();
+    // iOS stops the camera in the background — bring it back
+    if (cam.stream && cam.stream.getVideoTracks().some(t => t.readyState === 'ended')) refreshLocal();
+  }
+});
 
 function toast(msg, ms = 2400, onTap = null) {
   const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
@@ -203,6 +211,7 @@ function onStateChanged(prev) {
     if (fresh.length) { toast(fresh.map(p => `${P(p).avatar} ${P(p).name}`).join(', ') + ' joined the table!'); SFX.pop(); }
   }
   update();
+  if (cam.on) renderCams();
   if (amHost()) hostKick();
 }
 function onMoveRow(m) {
@@ -228,6 +237,7 @@ function subscribe() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'moves', filter: 'room=eq.' + room }, p => onMoveRow(p.new))
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat', filter: 'room=eq.' + room }, p => { addMsg(p.new, true); renderChat(); patchLive(); })
     .on('broadcast', { event: 'react' }, ({ payload }) => showReact(payload))
+    .on('broadcast', { event: 'rtc' }, ({ payload }) => onRtc(payload))
     .on('presence', { event: 'sync' }, () => {
       online = new Set(Object.keys(channel.presenceState()));
       if (!spectator) online.add(me.id);
@@ -236,7 +246,7 @@ function subscribe() {
       if (amHost()) hostKick();
     })
     .subscribe(async status => {
-      if (status === 'SUBSCRIBED') { await channel.track({ spectator, t: Date.now() }); refresh(); loadChat(); }
+      if (status === 'SUBSCRIBED') { await channel.track({ spectator, t: Date.now() }); refresh(); loadChat(); if (cam.on) hello(); }
     });
 }
 
@@ -697,6 +707,244 @@ async function sendChat(text) {
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && chat.open) openChat(false); });
 })();
 
+// ---------- live video: phones connect directly (WebRTC mesh); setup messages ride the Supabase channel ----------
+const RTC_CFG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }] };
+const cam = { on: false, stream: null, sid: null, mic: false, hear: false, facing: 'user', peers: new Map(), tiles: new Map(), spot: null };
+const camWho = () => joined() ? { name: P(me.id).name, avatar: P(me.id).avatar } : { name: spectator ? 'Table cam' : (me.name || 'Guest'), avatar: spectator ? '📺' : me.avatar };
+function rtcSend(to, type, data, tosid) {
+  if (!channel) return;
+  channel.send({ type: 'broadcast', event: 'rtc', payload: { from: me.id, sid: cam.sid, to: to || null, tosid: tosid || null, type, data } });
+}
+function hello(to, re) { const w = camWho(); rtcSend(to, 'hello', { send: !!cam.stream, name: w.name, avatar: w.avatar, re: !!re }); }
+
+function askCam() {
+  const el = document.getElementById('camAsk');
+  el.querySelector('[data-cam="off"]').classList.toggle('hidden', !cam.on);
+  el.querySelector('[data-cam="share"]').textContent = cam.stream ? '🔄 Restart my camera' : '📷 Share my camera';
+  el.querySelector('[data-cam="watch"]').textContent = cam.on && cam.stream ? '🙈 Stop my camera (keep watching)' : '👀 Just watch';
+  el.classList.remove('hidden');
+}
+(function wireCamAsk() {
+  const el = document.getElementById('camAsk');
+  el.onclick = e => { if (e.target === el) el.classList.add('hidden'); };
+  el.querySelectorAll('[data-cam]').forEach(b => b.onclick = () => {
+    el.classList.add('hidden');
+    const a = b.dataset.cam;
+    if (a === 'share') startCams(true); else if (a === 'watch') startCams(false); else if (a === 'off') stopCams();
+  });
+  const sp = document.getElementById('spot');
+  sp.onclick = () => { sp.classList.add('hidden'); sp.querySelector('video').srcObject = null; cam.spot = null; };
+  window.addEventListener('pagehide', () => { if (cam.on) rtcSend(null, 'bye'); });
+})();
+
+async function getMedia() {
+  const st = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: cam.facing, width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15, max: 20 } },
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  const vt = st.getVideoTracks()[0];
+  if (vt) vt.onended = () => { if (cam.stream && document.visibilityState === 'visible') refreshLocal(); };
+  return st;
+}
+const applyMic = () => { if (cam.stream) cam.stream.getAudioTracks().forEach(t => { t.enabled = cam.mic; }); };
+
+async function startCams(share) {
+  if (!room) return;
+  if (!window.RTCPeerConnection || !navigator.mediaDevices) { toast('Live video isn’t supported in this browser 😕', 4000); return; }
+  let stream = null;
+  if (share) {
+    try { stream = await getMedia(); }
+    catch (e) { toast('📷 Camera blocked — allow Camera & Microphone for this site (iPhone: Settings › Safari › Camera), then try again', 6000); return; }
+  }
+  if (cam.on) stopCams(true);
+  cam.stream = stream; cam.on = true; cam.sid = rid(8); cam.mic = false; applyMic();
+  document.getElementById('cams').classList.remove('hidden');
+  renderCams(); hello();
+  const cl = document.getElementById('camLive'); if (cl) cl.classList.remove('hidden');
+  toast(share ? '📹 You’re on camera! Mic is off — tap 🎙️ to talk.' : '👀 Watching the family cams');
+}
+function stopCams(silent) {
+  if (cam.on) rtcSend(null, 'bye');
+  for (const pid of [...cam.peers.keys()]) dropPeer(pid);
+  if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
+  cam.stream = null; cam.on = false;
+  for (const el of cam.tiles.values()) el.remove();
+  cam.tiles.clear();
+  document.getElementById('cams').classList.add('hidden');
+  document.documentElement.style.setProperty('--camh', '0px');
+  const cl = document.getElementById('camLive'); if (cl) cl.classList.add('hidden');
+  if (!silent) toast('Video off');
+}
+async function refreshLocal() {
+  if (!cam.stream) return;
+  try {
+    const ns = await getMedia();
+    for (const peer of cam.peers.values()) for (const snd of peer.pc.getSenders()) {
+      const kind = snd.track && snd.track.kind; const nt = kind && ns.getTracks().find(t => t.kind === kind);
+      if (nt) await snd.replaceTrack(nt).catch(() => {});
+    }
+    cam.stream.getTracks().forEach(t => t.stop());
+    cam.stream = ns; applyMic(); renderCams();
+  } catch (e) { toast('Couldn’t restart the camera — tap 📹 to try again'); }
+}
+
+function makePeer(pid, sid, info) {
+  const pc = new RTCPeerConnection(RTC_CFG);
+  const peer = { pid, sid, pc, polite: me.id > pid, makingOffer: false, ignoreOffer: false, stream: null, name: info.name, avatar: info.avatar, info, born: Date.now(), cq: [], ct: null, tuned: false };
+  cam.peers.set(pid, peer);
+  if (cam.stream) cam.stream.getTracks().forEach(t => pc.addTrack(t, cam.stream));
+  else { pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' }); }
+  pc.onnegotiationneeded = async () => {
+    try { peer.makingOffer = true; await pc.setLocalDescription(); rtcSend(pid, 'desc', pc.localDescription.toJSON(), peer.sid); }
+    catch (e) { console.warn('rtc offer', e); } finally { peer.makingOffer = false; }
+  };
+  pc.onicecandidate = ({ candidate }) => {
+    if (!candidate) return;
+    peer.cq.push(candidate.toJSON());
+    if (!peer.ct) peer.ct = setTimeout(() => { peer.ct = null; if (peer.cq.length) rtcSend(pid, 'cand', peer.cq.splice(0), peer.sid); }, 300);
+  };
+  pc.ontrack = e => {
+    if (e.streams && e.streams[0]) peer.stream = e.streams[0];
+    else { peer.stream = peer.stream || new MediaStream(); peer.stream.addTrack(e.track); }
+    e.track.onunmute = () => renderCams();
+    renderCams();
+  };
+  pc.onconnectionstatechange = () => {
+    const st = pc.connectionState;
+    if (st === 'connected' && !peer.tuned) {
+      peer.tuned = true;
+      // keep each video stream light so a phone can handle several at once
+      for (const snd of pc.getSenders()) if (snd.track && snd.track.kind === 'video') {
+        try { const prm = snd.getParameters(); if (!prm.encodings || !prm.encodings.length) prm.encodings = [{}]; prm.encodings[0].maxBitrate = 250000; snd.setParameters(prm).catch(() => {}); } catch (x) {}
+      }
+    }
+    if (st === 'failed') { try { pc.restartIce(); } catch (x) {} }
+    if (st === 'closed') dropPeer(pid);
+    renderCams();
+  };
+  return peer;
+}
+function dropPeer(pid) {
+  const peer = cam.peers.get(pid); if (!peer) return;
+  cam.peers.delete(pid);
+  try { peer.pc.close(); } catch (e) {}
+  renderCams();
+}
+async function onRtc(m) {
+  if (!cam.on || !m || m.from === me.id) return;
+  if (m.to && m.to !== me.id) return;
+  if (m.tosid && m.tosid !== cam.sid) return;
+  let peer = cam.peers.get(m.from);
+  try {
+    if (m.type === 'hello') {
+      const d = m.data || {};
+      if (peer && peer.sid === m.sid && !d.re) { peer.name = d.name; peer.avatar = d.avatar; if (!m.to) hello(m.from); return; }
+      if (peer) dropPeer(m.from);
+      if (cam.stream || d.send) makePeer(m.from, m.sid, d);
+      if (!m.to) hello(m.from);
+    } else if (m.type === 'desc') {
+      if (!peer || peer.sid !== m.sid) {
+        if (m.data.type !== 'offer') return;
+        if (peer) dropPeer(m.from);
+        peer = makePeer(m.from, m.sid, {});
+      }
+      const pc = peer.pc, desc = m.data;
+      const collision = desc.type === 'offer' && (peer.makingOffer || pc.signalingState !== 'stable');
+      peer.ignoreOffer = !peer.polite && collision;
+      if (peer.ignoreOffer) return;
+      await pc.setRemoteDescription(desc);
+      if (desc.type === 'offer') { await pc.setLocalDescription(); rtcSend(m.from, 'desc', pc.localDescription.toJSON(), peer.sid); }
+    } else if (m.type === 'cand') {
+      if (!peer || peer.sid !== m.sid) return;
+      for (const c of m.data || []) { try { await peer.pc.addIceCandidate(c); } catch (e) { if (!peer.ignoreOffer) console.warn('rtc cand', e); } }
+    } else if (m.type === 'bye') {
+      if (peer) dropPeer(m.from);
+    }
+  } catch (e) { console.warn('rtc', e); }
+}
+
+function renderCams() {
+  const box = document.getElementById('camTiles'); if (!box) return;
+  const vip = state && vipPid(state);
+  const want = [];
+  if (cam.stream) want.push({ id: '__me', stream: cam.stream, name: 'You', self: true, vip: vip === me.id });
+  for (const peer of cam.peers.values()) {
+    const vt = peer.stream && peer.stream.getVideoTracks()[0];
+    if (vt && vt.readyState === 'live') want.push({ id: peer.pid, stream: peer.stream, name: (state && state.players[peer.pid] ? state.players[peer.pid].name : peer.name) || 'Guest', vip: vip === peer.pid });
+  }
+  for (const [id, el] of cam.tiles) if (!want.some(w => w.id === id)) { el.remove(); cam.tiles.delete(id); }
+  for (const w of want) {
+    let el = cam.tiles.get(w.id);
+    if (!el) {
+      el = document.createElement('div'); el.className = 'cam-tile' + (w.self ? ' self' : '');
+      el.innerHTML = '<video playsinline autoplay muted></video><span class="cam-nm"></span>';
+      el.onclick = () => spotlight(w.id);
+      box.appendChild(el); cam.tiles.set(w.id, el);
+    }
+    const v = el.querySelector('video');
+    if (v.srcObject !== w.stream) v.srcObject = w.stream;
+    v.muted = w.self ? true : !cam.hear;
+    v.play().catch(() => {});
+    el.querySelector('.cam-nm').textContent = (w.vip ? '👑 ' : '') + w.name;
+    el.classList.toggle('vip', !!w.vip);
+  }
+  const empty = box.querySelector('.cam-empty');
+  if (!want.length && !empty) box.insertAdjacentHTML('beforeend', '<div class="cam-empty">Nobody’s camera is on yet… tap 📹 to share yours!</div>');
+  if (want.length && empty) empty.remove();
+  renderCamCtl();
+  const bar = document.getElementById('cams');
+  document.documentElement.style.setProperty('--camh', cam.on ? bar.offsetHeight + 'px' : '0px');
+}
+function renderCamCtl() {
+  const ctl = document.getElementById('camCtl'); if (!ctl) return;
+  const n = [...cam.peers.values()].filter(p => p.stream).length + (cam.stream ? 1 : 0);
+  const html = `${cam.stream ? `<button data-cc="mic" class="${cam.mic ? 'on' : ''}">${cam.mic ? '🎙️ Mic on' : '🎙️ Mic off'}</button><button data-cc="flip">🔄</button>` : ''}
+    <button data-cc="hear" class="${cam.hear ? 'on' : ''}">${cam.hear ? '🔊 Sound on' : '🔈 Sound off'}</button>
+    ${n > 6 ? '<span class="tiny">lots of cams — may get choppy</span>' : ''}
+    <button data-cc="menu">⋯</button>`;
+  if (ctl.__h === html) return;
+  ctl.__h = html; ctl.innerHTML = html;
+  ctl.querySelectorAll('[data-cc]').forEach(b => b.onclick = () => {
+    const a = b.dataset.cc;
+    if (a === 'mic') { cam.mic = !cam.mic; applyMic(); toast(cam.mic ? '🎙️ The family can hear you' : '🎙️ Mic off'); }
+    else if (a === 'hear') {
+      cam.hear = !cam.hear;
+      for (const [id, el] of cam.tiles) if (id !== '__me') { const v = el.querySelector('video'); v.muted = !cam.hear; v.play().catch(() => {}); }
+      const sv = document.querySelector('#spot video'); if (sv && cam.spot && cam.spot !== '__me') sv.muted = !cam.hear;
+      if (cam.hear) toast('🔊 Sound on — tip: at the table, keep just one phone’s sound on to avoid echo', 4000);
+    }
+    else if (a === 'flip') { cam.facing = cam.facing === 'user' ? 'environment' : 'user'; refreshLocal(); document.getElementById('cams').classList.toggle('rear', cam.facing !== 'user'); }
+    else if (a === 'menu') askCam();
+    renderCamCtl();
+  });
+}
+function spotlight(id) {
+  const el = cam.tiles.get(id); if (!el) return;
+  const sp = document.getElementById('spot'), v = sp.querySelector('video');
+  v.srcObject = el.querySelector('video').srcObject; v.muted = id === '__me' ? true : !cam.hear;
+  v.classList.toggle('mirror', id === '__me' && cam.facing === 'user');
+  sp.querySelector('.spot-nm').textContent = el.querySelector('.cam-nm').textContent;
+  sp.classList.remove('hidden'); cam.spot = id; v.play().catch(() => {});
+}
+// drop video peers whose phone left the room; redo the handshake for any link that got stuck
+setInterval(() => {
+  if (!cam.on) return;
+  for (const peer of [...cam.peers.values()]) {
+    if (presenceReady) {
+      if (online.has(peer.pid)) peer.gone = 0;
+      else if ((peer.gone = (peer.gone || 0) + 1) > 4) { dropPeer(peer.pid); continue; }
+    }
+    const st = peer.pc.connectionState;
+    // only one side of each pair (the smaller id) restarts, so they don't keep restarting each other
+    if (st !== 'connected' && Date.now() - peer.born > 9000 && me.id < peer.pid) {
+      const { pid, sid, info } = peer;
+      dropPeer(pid);
+      makePeer(pid, sid, info || {});
+      hello(pid, true);
+    }
+  }
+}, 3000);
+
 // ---------- reactions ----------
 let lastReact = 0;
 function sendReact(e) {
@@ -873,6 +1121,7 @@ function shell(main, opts = {}) {
       <span class="chip code">${esc(room)}</span>
       <span class="chip">${esc(roundLabel())}</span>
       <span class="timer hidden" id="timer"></span>
+      <button class="iconbtn chatbtn" id="camBtn" aria-label="Live video">📹<span class="badge live hidden" id="camLive">●</span></button>
       <button class="iconbtn chatbtn" id="chatBtn" aria-label="Family chat">💬<span class="badge hidden" id="chatBadge"></span></button>
       <button class="iconbtn" id="mute" aria-label="Sound">${muted ? '🔇' : '🔊'}</button>
     </div>
@@ -903,12 +1152,17 @@ function render() {
   pad = null; padNeedsBase = null; padBaseLoading = false;
   if (opts.after) opts.after();
   wireCommon();
+  // slim camera strip while drawing so the canvas keeps its room
+  document.body.classList.toggle('drawing', !!pad);
+  if (cam.on) renderCams();
 }
 function wireCommon() {
   const m = document.getElementById('mute');
   if (m) m.onclick = () => { muted = !muted; LS.set('fg_mute', muted); m.textContent = muted ? '🔇' : '🔊'; if (!muted) SFX.ding(); };
   $app.querySelectorAll('[data-react]').forEach(b => b.onclick = () => sendReact(b.dataset.react));
   const cb = document.getElementById('chatBtn'); if (cb) cb.onclick = () => openChat(true);
+  const vb = document.getElementById('camBtn'); if (vb) vb.onclick = () => askCam();
+  const cl = document.getElementById('camLive'); if (cl) cl.classList.toggle('hidden', !cam.on);
   $app.querySelectorAll('[data-host]').forEach(b => b.onclick = () => hostActions[b.dataset.host](b.dataset.arg));
 }
 
@@ -998,7 +1252,7 @@ const VIEWS = {
         <button class="btn green" id="share">📲 Send invite link</button>
       </div>`;
     return { html: `
-      <div class="center"><div class="logo">Fibsgiving</div><p class="tag">Draw it. Fib it. Find the truth.</p></div>
+      <div class="center"><div class="logo">${GAME_NAME}</div><div class="leo">${GAME_TAG}</div><p class="tag">Draw it. Fib it. Find the truth.</p></div>
       ${waitCard}
       ${host || spectator ? codeCard : ''}
       <div class="card">
@@ -1294,7 +1548,7 @@ function estimateMinutes(s) {
 function joinLink() { return location.origin + location.pathname + '?room=' + room; }
 function qrSVG(text) { try { const q = qrcode(0, 'M'); q.addData(text); q.make(); return q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); } catch (e) { return ''; } }
 async function shareLink(link) {
-  const data = { title: 'Join our Fibsgiving game!', text: `🦃 Join our Thanksgiving drawing game! Room code ${room}`, url: link };
+  const data = { title: `Join ${GAME_NAME}!`, text: `🦃 Join our ${GAME_NAME} game! (${GAME_TAG}) Room code ${room}`, url: link };
   try { if (navigator.share) { await navigator.share(data); return; } } catch (e) { if (e.name === 'AbortError') return; }
   try { await navigator.clipboard.writeText(link); toast('Link copied! Paste it in a text 💌'); } catch (e) { prompt('Copy this link:', link); }
 }
@@ -1303,7 +1557,7 @@ async function shareLink(link) {
 function renderHome() {
   const code = (params.get('room') || '').toUpperCase();
   $app.innerHTML = `
-    <div class="center" style="padding-top:4vh"><div class="big-emoji bob">🦃</div><div class="logo">Fibsgiving</div>
+    <div class="center" style="padding-top:4vh"><div class="big-emoji bob">🦃</div><div class="logo">${GAME_NAME}</div><div class="leo">${GAME_TAG}</div>
       <p class="tag">The draw-it, fib-it, find-the-truth family game.<br>Everyone plays on their own phone — near or far.</p></div>
     <div class="card stack">
       <div><label class="lbl">Your name</label><input class="txt" id="nm" maxlength="16" autocomplete="nickname" placeholder="Grandma Rosa" value="${esc(me.name)}"></div>
@@ -1361,7 +1615,7 @@ async function showGallery(code) {
   const chatHTML = (chatLog || []).map(m => `<div class="msg"><span class="mav">${esc(m.avatar)}</span><div class="bub"><div class="who">${esc(m.name)}</div>${esc(m.text)}<div class="ts">${chatTime(m.created_at)}</div></div></div>`).join('');
   const notes = [];
   for (const [key, p] of mcache) if (key.startsWith('thanks|') && p.text) notes.push([key.split('|')[3], p.text]);
-  $app.innerHTML = `<div class="center"><div class="logo">Keepsake Gallery</div><p class="tag">Fibsgiving · room ${esc(code)} · ${new Date(row.state.at || Date.now()).toLocaleDateString()}</p>
+  $app.innerHTML = `<div class="center"><div class="logo">Keepsake Gallery</div><p class="tag">${GAME_NAME} · room ${esc(code)} · ${new Date(row.state.at || Date.now()).toLocaleDateString()}</p>
       <p class="tiny">Long-press (or right-click) any picture to save it 💾</p></div>
     ${arts ? `<h2>🖼️ Masterpieces</h2><div class="gal">${arts}</div>` : ''}
     ${relays ? `<h2 class="mt">🔄 Pass the Canvas</h2><div class="gal">${relays}</div>` : ''}
@@ -1399,7 +1653,7 @@ setInterval(() => {
 setInterval(() => { if (room && state && document.visibilityState === 'visible') fetchRoom(room).then(r => r && onRoomRow(r, false)).catch(() => {}); }, 8000);
 
 // ---------- boot ----------
-window.__fg = { chat, sendChat, get state() { return state; }, get me() { return me; }, get pad() { return pad; }, hostActions, submit, keys, mcache, get online() { return online; } };
+window.__fg = { chat, sendChat, cam, startCams, stopCams, get state() { return state; }, get me() { return me; }, get pad() { return pad; }, hostActions, submit, keys, mcache, get online() { return online; } };
 if (params.get('gallery')) showGallery(params.get('gallery').toUpperCase());
 else {
   const code = (params.get('room') || '').toUpperCase();
