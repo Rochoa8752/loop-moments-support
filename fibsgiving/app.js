@@ -18,10 +18,11 @@ const REACTS = ['😂','😍','🤯','👏','🦃','🔥','💀'];
 const ROUND_INFO = {
   fib:      { emoji:'🖼️', title:'Fib Frames', rules:['You get a secret, ridiculous prompt. Draw it!','Everyone else invents a fake title for your drawing.','Then find the REAL title among the fibs. Fooling people scores big.'] },
   portrait: { emoji:'👨‍👩‍👧‍👦', title:'Family Portraits', rules:['Your secret prompt stars someone playing tonight.','Draw it — be kind… ish 😇','Your fibs should star family members too!'] },
+  chain:    { emoji:'🔄', title:'Pass the Canvas', rules:['Everyone starts a drawing at the same time. You get 30 seconds!','⏰ Then your canvas passes to the next person, who keeps drawing on top of it.','After a few passes, watch each masterpiece come to life, then vote for your favorite.'] },
   monster:  { emoji:'🧟', title:'Frankenfeast', rules:['Three artists, one creature: head, body, legs.','You only see a tiny sliver of the part above yours.','Then we reveal each monster and vote on the best name.'] },
   thanks:   { emoji:'🧡', title:'The Thankful Wall', rules:['No points. All heart.','Write a note for the table — or for our Guest of Honor 👑','Then we read them together.'] }
 };
-const ROUND_ORDER = ['fib','portrait','monster','thanks'];
+const ROUND_ORDER = ['fib','portrait','chain','monster','thanks'];
 const PARTS = ['HEAD','BODY','LEGS'];
 
 // ---------- utils ----------
@@ -109,6 +110,11 @@ function onlinePlayers(s = state) {
 }
 const T = sec => Math.round(sec * 1000 * ((state && state.settings && state.settings.pace) || 1));
 const drawerOf = (s, c, st) => s.mplayers[(c + st) % s.mplayers.length];
+const chainDrawer = (s, c, t) => s.cplayers[(c + t) % s.cplayers.length];
+function myChainCanvas(s = state) {
+  const N = (s.cplayers || []).length, idx = N ? s.cplayers.indexOf(me.id) : -1;
+  return idx < 0 ? -1 : ((idx - s.ct) % N + N) % N;
+}
 
 function expected(s = state) {
   const on = onlinePlayers(s), k = String(s.ii ?? 0);
@@ -120,6 +126,8 @@ function expected(s = state) {
     case 'mname': return on.map(p => [p, 'mname', String(s.mc)]);
     case 'mvote': return on.map(p => [p, 'mvote', String(s.mc)]);
     case 'twrite': return on.map(p => [p, 'thanks', '']);
+    case 'cdraw': { const out = []; for (let c = 0; c < s.cplayers.length; c++) { const p = chainDrawer(s, c, s.ct); if (on.includes(p)) out.push([p, 'chain', c + ':' + s.ct]); } return out; }
+    case 'cvote': return on.map(p => [p, 'cvote', '']);
   }
   return [];
 }
@@ -182,7 +190,8 @@ function onRoomRow(row, live) {
 }
 function onStateChanged(prev) {
   if (!prev || prev.rc !== state.rc) fetchMoves(state.rc);
-  if (prev && (prev.phase !== state.phase || prev.ii !== state.ii || prev.stage !== state.stage || prev.mc !== state.mc)) {
+  if (prev && prev.phase === 'cdraw' && state.phase === 'cdraw' && prev.ct !== state.ct && !spectator) toast('🔄 Canvases passed! Keep the masterpiece going.');
+  if (prev && (prev.phase !== state.phase || prev.ii !== state.ii || prev.stage !== state.stage || prev.mc !== state.mc || prev.ct !== state.ct || prev.ci !== state.ci)) {
     if (state.phase === 'final') { SFX.fanfare(); confetti(120); }
     else if (state.phase !== 'reveal') SFX.ding();
   }
@@ -311,6 +320,10 @@ async function hostStep() {
     case 'mreveal': if (timeUp) await nextCreature(); break;
     case 'twrite': if (ready) await afterTwrite(); break;
     case 'tshow': if (timeUp) await commit(nextRound); break;
+    case 'cdraw': if (ready) await afterCturn(); break;
+    case 'cshow': if (timeUp) await nextCanvas(); break;
+    case 'cvote': if (ready) await afterCvote(); break;
+    case 'creveal': if (timeUp) await commit(toLeaderboard); break;
   }
 }
 
@@ -318,6 +331,7 @@ function resetRoundFields(n) {
   n.prompts = {}; n.items = []; n.ii = 0; n.options = null; n.reveal = null;
   n.mplayers = []; n.C = 0; n.stage = 0; n.mc = 0; n.themes = []; n.mopts = null; n.mreveal = null; n.mtitles = [];
   n.notes = null;
+  n.cplayers = []; n.cturns = 0; n.ct = 0; n.clast = []; n.cframes = []; n.clist = []; n.ci = 0; n.cres = null;
 }
 function nextRound(n) {
   n.ri += 1; n.rc += 1;
@@ -360,6 +374,12 @@ async function beginRound() {
     const mp = shuffle(players), C = Math.min(mp.length, 6);
     const themes = shuffle(DECKS.monster).slice(0, C);
     await commit(n => { n.mplayers = mp; n.C = C; n.themes = themes; n.stage = 0; n.mtitles = []; n.phase = 'mdraw'; n.phaseAt = t; n.deadline = t + T(75); });
+  } else if (type === 'chain') {
+    const cp = shuffle(players), N = cp.length, cturns = N === 2 ? 4 : 3;
+    await commit(n => {
+      n.cplayers = cp; n.cturns = cturns; n.ct = 0; n.clast = Array(N).fill(-1); n.cframes = Array.from({ length: N }, () => []);
+      n.chist = n.chist || []; n.phase = 'cdraw'; n.phaseAt = t; n.deadline = t + T(30);
+    });
   } else if (type === 'thanks') {
     await commit(n => { n.phase = 'twrite'; n.phaseAt = t; n.deadline = t + T(100); });
   } else {
@@ -497,6 +517,50 @@ async function nextCreature() {
     else toLeaderboard(n);
   });
 }
+const showDur = frames => frames * 1800 + 4500;
+async function afterCturn() {
+  await fetchKeys();
+  const s = state, N = s.cplayers.length, clast = s.clast.slice(), cframes = clone(s.cframes);
+  for (let c = 0; c < N; c++) {
+    const p = chainDrawer(s, c, s.ct);
+    if (keys.has(mkey('chain', s.rc, c + ':' + s.ct, p))) { clast[c] = s.ct; cframes[c].push({ t: s.ct, pid: p }); }
+  }
+  await commit(n => {
+    n.clast = clast; n.cframes = cframes;
+    if (n.ct + 1 < n.cturns) { n.ct += 1; n.phaseAt = now(); n.deadline = now() + T(30); return; }
+    const list = clast.map((t, c) => (t >= 0 ? c : -1)).filter(c => c >= 0);
+    n.chist = n.chist || [];
+    for (const c of list) n.chist.push({ r: n.rc, c, frames: cframes[c] });
+    if (!list.length) return toLeaderboard(n);
+    n.clist = list; n.ci = 0; n.phase = 'cshow'; n.phaseAt = now(); n.deadline = now() + showDur(cframes[list[0]].length);
+  });
+}
+async function nextCanvas() {
+  await commit(n => {
+    if (n.ci + 1 < n.clist.length) { n.ci += 1; n.phaseAt = now(); n.deadline = now() + showDur(n.cframes[n.clist[n.ci]].length); }
+    else if (n.clist.length >= 2) { n.phase = 'cvote'; n.phaseAt = now(); n.deadline = now() + T(25); }
+    else toLeaderboard(n);
+  });
+}
+async function afterCvote() {
+  await fetchMoves(state.rc, ['cvote']);
+  const s = state, votes = {}, deltas = {};
+  for (const c of s.clist) votes[c] = [];
+  for (const p of s.order) {
+    const v = mcache.get(mkey('cvote', s.rc, '', p));
+    if (v && votes[v.choice]) votes[v.choice].push(p);
+  }
+  const contributors = c => [...new Set(s.cframes[c].map(f => f.pid))];
+  for (const c of s.clist) for (const a of contributors(c)) deltas[a] = (deltas[a] || 0) + 300 * votes[c].length;
+  const top = Math.max(...s.clist.map(c => votes[c].length));
+  const win = s.clist.find(c => votes[c].length === top);
+  await commit(n => {
+    for (const [p, d] of Object.entries(deltas)) if (n.players[p] && d) { n.players[p].score += d; n.players[p].stats.cvotes = (n.players[p].stats.cvotes || 0) + d / 300; }
+    n.cres = { votes, win, deltas };
+    const h = (n.chist || []).find(x => x.r === n.rc && x.c === win); if (h) h.win = true;
+    n.phase = 'creveal'; n.phaseAt = now(); n.deadline = now() + 9500;
+  });
+}
 async function afterTwrite() {
   await fetchMoves(state.rc, ['thanks']);
   const s = state;
@@ -513,7 +577,8 @@ function computeAwards(n) {
     ['correct', '🔍', 'Truth Detective', 'spotted the truth {n}×'],
     ['likes', '❤️', 'Crowd Favorite', 'collected {n} heart(s)'],
     ['seen', '🎨', 'Clearest Artist', '{n} people got their drawings right'],
-    ['mvotes', '🧟', 'Monster Namer', 'won {n} name votes']
+    ['mvotes', '🧟', 'Monster Namer', 'won {n} name votes'],
+    ['cvotes', '🔄', 'Relay Legend', 'helped paint canvases that got {n} vote(s)']
   ];
   const out = [];
   const vip = vipPid(n);
@@ -573,12 +638,12 @@ function showReact({ e, pid }) {
 }
 
 // ---------- drawing pad ----------
-let pad = null;
+let pad = null, padNeedsBase = null, padBaseLoading = false;
 const COLORS = ['#2b1a12','#ffffff','#c2264b','#f28c28','#f5c542','#5a8f3d','#3a7bd5','#8e44ad','#8b5a2b','#f7a8c4','#f1c27d','#7f8c8d'];
 function makePad(canvas, w, h) {
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d');
-  let strokes = [], cur = null, color = COLORS[0], size = 8, erase = false, bgc = '#ffffff';
+  let strokes = [], cur = null, color = COLORS[0], size = 8, erase = false, bgc = '#ffffff', baseImg = null;
   const fill = () => { ctx.fillStyle = bgc; ctx.fillRect(0, 0, w, h); };
   function drawStroke(s) {
     if (s.bg) { bgc = s.bg; return; }
@@ -589,7 +654,7 @@ function makePad(canvas, w, h) {
     for (let i = 1; i < p.length - 1; i++) ctx.quadraticCurveTo(p[i][0], p[i][1], (p[i][0] + p[i + 1][0]) / 2, (p[i][1] + p[i + 1][1]) / 2);
     const l = p[p.length - 1]; ctx.lineTo(l[0], l[1]); ctx.stroke();
   }
-  function redraw() { bgc = '#ffffff'; strokes.filter(s => s.bg).forEach(drawStroke); fill(); strokes.filter(s => !s.bg).forEach(drawStroke); }
+  function redraw() { bgc = '#ffffff'; strokes.filter(s => s.bg).forEach(drawStroke); fill(); if (baseImg) ctx.drawImage(baseImg, 0, 0, w, h); strokes.filter(s => !s.bg).forEach(drawStroke); }
   fill();
   const pos = e => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * w / r.width, (e.clientY - r.top) * h / r.height]; };
   // iOS Safari: touch-action alone isn't always honored, so block the native scroll/zoom gesture explicitly
@@ -617,19 +682,21 @@ function makePad(canvas, w, h) {
     bucket() { strokes.push({ bg: color }); redraw(); },
     undo() { strokes.pop(); redraw(); }, clear() { strokes = []; redraw(); },
     get empty() { return strokes.length === 0; },
+    get hasBase() { return !!baseImg; },
+    setBase(src) { return new Promise(res => { const im = new Image(); im.onload = () => { baseImg = im; redraw(); res(true); }; im.onerror = () => res(false); im.src = src; }); },
     toData() { return canvas.toDataURL('image/jpeg', 0.82); },
     // test hook
     _scribble() { for (let i = 0; i < 6; i++) { const p = []; for (let j = 0; j < 12; j++) p.push([Math.random() * w, Math.random() * h]); strokes.push({ c: pick(COLORS), s: 6 + Math.random() * 12, p }); } redraw(); }
   };
 }
-function toolsHTML() {
+function toolsHTML(o = {}) {
   return `<div class="swatches">
     ${COLORS.map((c, i) => `<div class="sw${i === 0 ? ' sel' : ''}" data-color="${c}" style="background:${c}"></div>`).join('')}
   </div>
   <div class="tools">
     ${[4, 9, 18, 32].map((s, i) => `<div class="sz${i === 1 ? ' sel' : ''}" data-size="${s}"><i style="width:${Math.min(s, 24)}px;height:${Math.min(s, 24)}px"></i></div>`).join('')}
     <button class="tool" data-tool="erase" aria-label="Eraser">🧽</button>
-    <button class="tool" data-tool="bucket" aria-label="Fill background">🪣</button>
+    <button class="tool${o.noBucket ? ' hidden' : ''}" data-tool="bucket" aria-label="Fill background">🪣</button>
     <button class="tool" data-tool="undo" aria-label="Undo">↩️</button>
     <button class="tool" data-tool="clear" aria-label="Clear">🗑️</button>
   </div>`;
@@ -661,11 +728,15 @@ async function sendArt(auto) {
   if (s.phase === 'mdraw') {
     const c = myCreature(); if (c < 0) return;
     kind = 'part'; k = c + ':' + s.stage;
+  } else if (s.phase === 'cdraw') {
+    const c = myChainCanvas(); if (c < 0) return;
+    kind = 'chain'; k = c + ':' + s.ct;
+    if (padNeedsBase && !pad.hasBase) { if (!auto) toast('⏳ Still loading the drawing — one sec!'); return; }
   } else if (s.phase !== 'draw') return;
   if (iSubmitted(kind, k)) return;
-  if (!auto && pad.empty && !confirm('Your canvas is empty! Send it anyway?')) return;
+  if (!auto && pad.empty && !confirm(kind === 'chain' && pad.hasBase ? "You haven't added anything yet! Pass it on anyway?" : 'Your canvas is empty! Send it anyway?')) return;
   sendingArt = true;
-  try { SFX.send(); await submit(kind, k, { img: pad.toData() }); if (auto) toast('⏰ Time! Your drawing was sent.'); }
+  try { SFX.send(); await submit(kind, k, { img: pad.toData() }); if (auto) toast(kind === 'chain' ? '⏰ Time! Passing your canvas along…' : '⏰ Time! Your drawing was sent.'); }
   finally { sendingArt = false; }
 }
 function myCreature() {
@@ -694,6 +765,10 @@ function viewKey() {
     case 'twrite': return base + iSubmitted('thanks');
     case 'tshow': return base + noteIndex();
     case 'final': return base + amHost();
+    case 'cdraw': return base + s.ct + '|' + iSubmitted('chain', myChainCanvas() + ':' + s.ct);
+    case 'cshow': return base + s.ci + '|' + chainFrame();
+    case 'cvote': return base + JSON.stringify(mine('cvote') || null);
+    case 'creveal': return base;
   }
   return base;
 }
@@ -702,8 +777,9 @@ function update(force) {
   if (force || k !== lastKey) { lastKey = k; render(); }
   patchLive();
 }
-const revealStep = () => { const s = state; if (!s.reveal) return 0; return Math.min(Math.floor((now() - s.phaseAt) / 2800) + 1, s.reveal.seq.length + 1); };
-const noteIndex = () => { const s = state; if (!s.notes) return 0; return Math.min(Math.floor((now() - s.phaseAt) / 7000), s.notes.length - 1); };
+const revealStep = () => { const s = state; if (!s.reveal) return 0; return Math.max(1, Math.min(Math.floor((now() - s.phaseAt) / 2800) + 1, s.reveal.seq.length + 1)); };
+const chainFrame = () => { const s = state, f = s.cframes && s.clist && s.cframes[s.clist[s.ci]]; return f ? Math.max(0, Math.min(Math.floor((now() - s.phaseAt) / 1800), f.length - 1)) : 0; };
+const noteIndex = () => { const s = state; if (!s.notes) return 0; return Math.max(0, Math.min(Math.floor((now() - s.phaseAt) / 7000), s.notes.length - 1)); };
 
 function setHTML(el, html) { if (el && el.__h !== html) { el.__h = html; el.innerHTML = html; } }
 
@@ -746,7 +822,7 @@ function render() {
   const V = VIEWS[ph];
   if (V) { const r = V(s); html = r.html; opts = r; }
   $app.innerHTML = shell(html, opts);
-  pad = null;
+  pad = null; padNeedsBase = null; padBaseLoading = false;
   if (opts.after) opts.after();
   wireCommon();
 }
@@ -770,7 +846,7 @@ function patchLive() {
   // timer
   const tm = document.getElementById('timer');
   if (tm) {
-    const timed = ['draw', 'fib', 'vote', 'mdraw', 'mname', 'mvote', 'twrite'].includes(state.phase) && state.deadline;
+    const timed = ['draw', 'fib', 'vote', 'mdraw', 'mname', 'mvote', 'twrite', 'cdraw', 'cvote'].includes(state.phase) && state.deadline;
     if (timed) {
       const left = Math.max(0, Math.ceil((state.deadline - now()) / 1000));
       tm.classList.remove('hidden');
@@ -797,6 +873,19 @@ function patchLive() {
       return `<div class="pl${pp.vip ? ' vip' : ''}${off ? ' off' : ''}" data-pid="${p}">${pp.vip ? '<span class="crown">👑</span>' : ''}<span class="em">${pp.avatar}</span><span class="nm">${esc(pp.name)}${p === state.host ? ' <span class="tiny">host</span>' : ''}</span><span class="dot"></span></div>`;
     }).join(''));
     if (amHost()) pl.querySelectorAll('[data-pid]').forEach(el => el.onclick = () => hostActions.vip(el.dataset.pid));
+  }
+  // continuing someone's canvas: load their drawing underneath ours
+  if (pad && padNeedsBase && !padBaseLoading) {
+    const bp = mcache.get(padNeedsBase);
+    if (bp && bp.img) {
+      padBaseLoading = true;
+      const myPad = pad;
+      pad.setBase(bp.img).then(ok => {
+        if (pad !== myPad) return;
+        padBaseLoading = false;
+        if (ok) { const b = document.getElementById('sendArt'); if (b) { b.disabled = false; b.textContent = '➡️ Pass it on'; } }
+      });
+    } else wantPayload(padNeedsBase);
   }
   // images
   document.querySelectorAll('img[data-mv]').forEach(img => {
@@ -1041,6 +1130,61 @@ const VIEWS = {
       <div class="note mt">${esc(n.text).replace(/\n/g, '<br>')}<div class="from">— ${nm(n.pid)}</div></div>
       <p class="center tiny mt">Send some love with the buttons below 👇</p>`, after() { SFX.ding(); } };
   },
+  cdraw(s) {
+    const c = myChainCanvas(), t = s.ct;
+    if (spectator || c < 0) return { html: `<div class="center-screen"><div class="big-emoji bob">🔄</div><h2>Canvases are on the move…</h2><p>Pass ${t + 1} of ${s.cturns}</p>${!spectator ? '<p>You joined mid-round — jump in next round! 🥧</p>' : ''}<div id="wait"></div></div>` };
+    if (iSubmitted('chain', c + ':' + t)) return { html: `<div class="center-screen"><div class="big-emoji">➡️</div><h2>Passed along!</h2><p>${t + 1 < s.cturns ? 'Get ready — another canvas is coming your way…' : 'That was the last pass. Get ready for the big reveal!'}</p><div id="wait"></div></div>` };
+    const lt = s.clast[c], baseKey = lt >= 0 ? mkey('chain', s.rc, c + ':' + lt, chainDrawer(s, c, lt)) : null;
+    const sparks = DECKS.sparks || ['a face'];
+    const head = t === 0
+      ? `<small>Pass 1 of ${s.cturns} · you're the starter!</small>Start a masterpiece!<div class="tiny" style="margin-top:4px;opacity:.9">Need an idea? Try ${esc(sparks[(c * 7 + s.rc) % sparks.length])}</div>`
+      : `<small>Pass ${t + 1} of ${s.cturns}${t + 1 === s.cturns ? ' · final touches!' : ''}</small>${baseKey ? 'Keep it going! Add to this drawing' : 'The last artist left it blank — fresh start!'}`;
+    return {
+      noReact: true,
+      html: `<div class="secret">${head}</div>
+        <div class="drawzone sq"><div class="canvas-wrap"><canvas id="pad"></canvas></div></div>
+        ${toolsHTML({ noBucket: !!baseKey })}
+        <button class="btn" id="sendArt" ${baseKey ? 'disabled' : ''}>${baseKey ? '⏳ Loading the drawing…' : '➡️ Pass it on'}</button>`,
+      after() { wirePad(600, 600); padNeedsBase = baseKey; document.getElementById('sendArt').onclick = () => sendArt(false); }
+    };
+  },
+  cshow(s) {
+    const c = s.clist[s.ci], frames = s.cframes[c], idx = chainFrame(), f = frames[idx];
+    const done = idx === frames.length - 1;
+    return {
+      html: `<div class="phase-title">Masterpiece ${s.ci + 1} of ${s.clist.length}</div>
+        <div class="prompt"><small>${done ? '✨ The finished work' : `Pass ${idx + 1} of ${frames.length}…`}</small></div>
+        <div class="art"><img alt="" width="600" height="600" style="height:auto" data-mv="${mkey('chain', s.rc, c + ':' + f.t, f.pid)}"></div>
+        ${frames.map(x => `<img alt="" class="hidden" data-mv="${mkey('chain', s.rc, c + ':' + x.t, x.pid)}">`).join('')}
+        <div class="card center" style="font-size:18px">${frames.map((x, i) => `<span style="opacity:${i <= idx ? 1 : .3};font-weight:${i === idx ? 700 : 500}">${nm(x.pid)}</span>`).join(' → ')}</div>`,
+      after() { if (done) SFX.fanfare(); else SFX.pop(); }
+    };
+  },
+  cvote(s) {
+    const cur = mine('cvote') || {}, can = !spectator && joined();
+    const last = c => { const fr = s.cframes[c], x = fr[fr.length - 1]; return mkey('chain', s.rc, c + ':' + x.t, x.pid); };
+    return {
+      html: `<div class="center"><div class="phase-title">Pass the Canvas</div><h2>Vote for your favorite masterpiece!</h2></div>
+        <div class="cgrid">${s.clist.map(c => `<div class="cpick${cur.choice === c ? ' sel' : ''}" data-cvote="${c}"><img alt="" width="600" height="600" style="height:auto" data-mv="${last(c)}"><div class="f">${faces([...new Set(s.cframes[c].map(x => x.pid))])}</div></div>`).join('')}</div>
+        <div id="wait"></div>`,
+      after() {
+        if (!can) return;
+        $app.querySelectorAll('[data-cvote]').forEach(el => el.onclick = () => { SFX.pop(); submit('cvote', '', { choice: +el.dataset.cvote }); });
+      }
+    };
+  },
+  creveal(s) {
+    const r = s.cres, last = c => { const fr = s.cframes[c], x = fr[fr.length - 1]; return mkey('chain', s.rc, c + ':' + x.t, x.pid); };
+    const others = s.clist.filter(c => c !== r.win).sort((a, b) => r.votes[b].length - r.votes[a].length);
+    const who = c => [...new Set(s.cframes[c].map(x => x.pid))];
+    return {
+      html: `<div class="center"><div class="big-emoji">🏆</div><h2>The family favorite!</h2></div>
+        <div class="art"><img alt="" width="600" height="600" style="height:auto" data-mv="${last(r.win)}"></div>
+        <div class="rv truth center"><div class="t">${who(r.win).map(nm).join(' → ')}</div><div class="meta">${r.votes[r.win].length} vote(s) ${faces(r.votes[r.win])} · +${300 * r.votes[r.win].length} each</div></div>
+        ${others.length ? `<div class="cgrid mt">${others.map(c => `<div class="cpick"><img alt="" width="600" height="600" style="height:auto" data-mv="${last(c)}"><div class="f">${r.votes[c].length} vote(s) ${faces(r.votes[c])}</div></div>`).join('')}</div>` : ''}`,
+      after() { SFX.fanfare(); confetti(50); }
+    };
+  },
   final(s) {
     const rows = s.order.slice().sort((a, b) => s.players[b].score - s.players[a].score);
     const top = rows.slice(0, 3), order = [top[1], top[0], top[2]];
@@ -1062,6 +1206,7 @@ function estimateMinutes(s) {
     if (r === 'fib' || r === 'portrait') m += (90 * p + n * (45 * p * .8 + 30 * p * .7 + 3 * n + 6)) / 60 + .5;
     else if (r === 'monster') m += (3 * 75 * p + Math.min(n, 6) * (40 * p * .8 + 25 * p * .8 + 9.5)) / 60 + .5;
     else if (r === 'thanks') m += (100 * p + n * 7) / 60;
+    else if (r === 'chain') m += ((n === 2 ? 4 : 3) * 30 * p + n * (3 * 1.8 + 4.5) + 25 * p * .8 + 9.5) / 60 + .3;
   }
   return m;
 }
@@ -1114,7 +1259,7 @@ async function showGallery(code) {
   const row = await fetchRoom(code).catch(() => null);
   if (!row) { $app.innerHTML = `<div class="center-screen"><h2>No gallery for ${esc(code)}</h2></div>`; return; }
   state = row.state; room = code;
-  const { data } = await sb.from('moves').select('pid,kind,r,k,payload').eq('room', code).in('kind', ['drawing', 'part', 'thanks']);
+  const { data } = await sb.from('moves').select('pid,kind,r,k,payload').eq('room', code).in('kind', ['drawing', 'part', 'thanks', 'chain']);
   for (const m of data || []) mcache.set(mkey(m.kind, m.r, m.k, m.pid), m.payload);
   const img = (key, w = 600, h = 600) => { const p = mcache.get(key); return p && p.img ? `<img alt="" width="${w}" height="${h}" style="height:auto" src="${p.img}">` : ''; };
   const s = state;
@@ -1125,14 +1270,21 @@ async function showGallery(code) {
   }).join('');
   const mons = uniq(s.mhistory, x => x.r + ':' + x.c).map(m => `<div class="art"><div class="creature">${m.drawers.map((d, st) => img(mkey('part', m.r, m.c + ':' + st, d), 600, 400)).join('')}</div>
     <div class="cap"><b>“${esc(m.title)}”</b><span>${esc(m.theme)} · by ${m.drawers.map(nm).join(' + ')}</span></div></div>`).join('');
+  const relays = uniq(s.chist, x => x.r + ':' + x.c).map(cv => {
+    const fr = cv.frames || []; if (!fr.length) return '';
+    const fin = fr[fr.length - 1], im = img(mkey('chain', cv.r, cv.c + ':' + fin.t, fin.pid)); if (!im) return '';
+    const steps = fr.map(x => { const p = mcache.get(mkey('chain', cv.r, cv.c + ':' + x.t, x.pid)); return p && p.img ? `<img alt="" src="${p.img}" style="width:${100 / fr.length}%;display:inline-block;border-right:2px solid #eee">` : ''; }).join('');
+    return `<div class="art">${im}<div style="line-height:0;background:#f4e3cc">${steps}</div><div class="cap"><b>${cv.win ? '🏆 Family favorite' : 'Relay masterpiece'}</b><span>${[...new Set(fr.map(x => x.pid))].map(nm).join(' → ')}</span></div></div>`;
+  }).join('');
   const notes = [];
   for (const [key, p] of mcache) if (key.startsWith('thanks|') && p.text) notes.push([key.split('|')[3], p.text]);
   $app.innerHTML = `<div class="center"><div class="logo">Keepsake Gallery</div><p class="tag">Fibsgiving · room ${esc(code)} · ${new Date(row.state.at || Date.now()).toLocaleDateString()}</p>
       <p class="tiny">Long-press (or right-click) any picture to save it 💾</p></div>
     ${arts ? `<h2>🖼️ Masterpieces</h2><div class="gal">${arts}</div>` : ''}
+    ${relays ? `<h2 class="mt">🔄 Pass the Canvas</h2><div class="gal">${relays}</div>` : ''}
     ${mons ? `<h2 class="mt">🧟 Frankenfeast Creatures</h2><div class="gal">${mons}</div>` : ''}
     ${notes.length ? `<h2 class="mt">🧡 The Thankful Wall</h2><div class="gal">${notes.map(([p, t]) => `<div class="note">${esc(t).replace(/\n/g, '<br>')}<div class="from">— ${nm(p)}</div></div>`).join('')}</div>` : ''}
-    ${!arts && !mons && !notes.length ? '<div class="card soft center">Nothing here yet — go play a round!</div>' : ''}
+    ${!arts && !mons && !relays && !notes.length ? '<div class="card soft center">Nothing here yet — go play a round!</div>' : ''}
     <p class="center mt"><a class="btn small ghost" href="?room=${esc(code)}" style="text-decoration:none">← Back to the game</a></p>`;
 }
 
@@ -1144,7 +1296,7 @@ setInterval(() => {
   // auto-submit right before the buzzer
   const s = state, left = s.deadline ? s.deadline - now() : Infinity;
   if (left < 1200 && joined()) {
-    if ((s.phase === 'draw' || s.phase === 'mdraw') && pad) sendArt(true);
+    if ((s.phase === 'draw' || s.phase === 'mdraw' || s.phase === 'cdraw') && pad) sendArt(true);
     const auto = [['fib', 'fibIn', 'fib', String(s.ii), 70], ['mname', 'mIn', 'mname', String(s.mc), 50], ['twrite', 'tIn', 'thanks', '', 280]];
     for (const [ph, id, kind, k, max] of auto) {
       if (s.phase !== ph) continue;

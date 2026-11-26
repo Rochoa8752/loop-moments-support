@@ -59,6 +59,12 @@ window.DECKS = {
     "Sir Gobbleton", "Gravy Gus", "The Casseroleosaurus", "Pie-thon", "Stuffzilla",
     "Lord Cranberry III", "Mashy McMashface", "The Yammer", "Drumstick Dan", "Count Crumbs"
   ],
+  // conversation starters for the first artist in Pass the Canvas
+  sparks: [
+    "a face", "a house", "a weird animal", "a turkey", "a car", "a tree", "a monster", "a hat",
+    "a boat", "a snowman", "a pie", "a superhero", "a robot", "a flower", "a castle", "a dinosaur",
+    "a rocket", "an eyeball", "a dog", "a giant sandwich"
+  ],
   thanks: [
     "Write a note for the whole table — something you're thankful for 🧡",
   ]

@@ -191,3 +191,10 @@ input.code{text-transform:uppercase;letter-spacing:8px;text-align:center;font-si
 .wide #app{max-width:1100px}
 .mt{margin-top:14px}.center{text-align:center}
 .hidden{display:none!important}
+
+/* Pass the Canvas */
+.cgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.cpick{background:#fff;border-radius:14px;overflow:hidden;border:4px solid transparent;box-shadow:var(--shadow);cursor:pointer}
+.cpick.sel{border-color:var(--orange);transform:scale(1.02)}
+.cpick img{width:100%;display:block}
+.cpick .f{padding:4px 8px;color:var(--ink);font-size:14px}
