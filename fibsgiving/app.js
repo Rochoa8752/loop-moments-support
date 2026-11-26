@@ -187,6 +187,10 @@ function onStateChanged(prev) {
     else if (state.phase !== 'reveal') SFX.ding();
   }
   if (prev && !prev.players[me.id] && state.players[me.id]) SFX.ding();
+  else if (prev && state.order.length > prev.order.length) {
+    const fresh = state.order.filter(p => !prev.order.includes(p) && p !== me.id);
+    if (fresh.length) { toast(fresh.map(p => `${P(p).avatar} ${P(p).name}`).join(', ') + ' joined the table!'); SFX.pop(); }
+  }
   update();
   if (amHost()) hostKick();
 }
@@ -588,6 +592,9 @@ function makePad(canvas, w, h) {
   function redraw() { bgc = '#ffffff'; strokes.filter(s => s.bg).forEach(drawStroke); fill(); strokes.filter(s => !s.bg).forEach(drawStroke); }
   fill();
   const pos = e => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * w / r.width, (e.clientY - r.top) * h / r.height]; };
+  // iOS Safari: touch-action alone isn't always honored, so block the native scroll/zoom gesture explicitly
+  const block = e => { if (e.cancelable) e.preventDefault(); };
+  ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange'].forEach(t => canvas.addEventListener(t, block, { passive: false }));
   canvas.addEventListener('pointerdown', e => {
     e.preventDefault(); try { canvas.setPointerCapture(e.pointerId); } catch (x) {}
     cur = { c: erase ? bgc : color, s: erase ? size * 2.5 : size, p: [pos(e)] }; strokes.push(cur); drawStroke(cur);
@@ -616,15 +623,15 @@ function makePad(canvas, w, h) {
   };
 }
 function toolsHTML() {
-  return `<div class="tools">
+  return `<div class="swatches">
     ${COLORS.map((c, i) => `<div class="sw${i === 0 ? ' sel' : ''}" data-color="${c}" style="background:${c}"></div>`).join('')}
   </div>
   <div class="tools">
-    ${[4, 9, 18, 32].map((s, i) => `<div class="sz${i === 1 ? ' sel' : ''}" data-size="${s}"><i style="width:${Math.min(s, 26)}px;height:${Math.min(s, 26)}px"></i></div>`).join('')}
-    <button class="tool" data-tool="erase">🧽 Eraser</button>
-    <button class="tool" data-tool="bucket">🪣 Fill bg</button>
-    <button class="tool" data-tool="undo">↩️</button>
-    <button class="tool" data-tool="clear">🗑️</button>
+    ${[4, 9, 18, 32].map((s, i) => `<div class="sz${i === 1 ? ' sel' : ''}" data-size="${s}"><i style="width:${Math.min(s, 24)}px;height:${Math.min(s, 24)}px"></i></div>`).join('')}
+    <button class="tool" data-tool="erase" aria-label="Eraser">🧽</button>
+    <button class="tool" data-tool="bucket" aria-label="Fill background">🪣</button>
+    <button class="tool" data-tool="undo" aria-label="Undo">↩️</button>
+    <button class="tool" data-tool="clear" aria-label="Clear">🗑️</button>
   </div>`;
 }
 function wirePad(w, h) {
@@ -810,17 +817,22 @@ const VIEWS = {
     const rounds = ROUND_ORDER.map(r => `<button class="${s.settings.rounds.includes(r) ? 'on' : ''}" ${host ? `data-host="round" data-arg="${r}"` : 'disabled'}>${ROUND_INFO[r].emoji} ${ROUND_INFO[r].title}</button>`).join('');
     const paces = [[0.75, '⚡ Speedy'], [1, '🙂 Normal'], [1.5, '🐢 Relaxed']].map(([v, l]) => `<button class="${s.settings.pace === v ? 'on' : ''}" ${host ? `data-host="pace" data-arg="${v}"` : 'disabled'}>${l}</button>`).join('');
     const est = Math.round(estimateMinutes(s));
-    return { html: `
-      <div class="center"><div class="logo">Fibsgiving</div><p class="tag">Draw it. Fib it. Find the truth.</p></div>
-      <div class="card center">
+    const waitCard = host
+      ? `<div class="card soft center"><b>🛋️ Waiting Room</b><br>Everyone who opens your link shows up below. Start whenever the crew is here!</div>`
+      : `<div class="card center"><div class="big-emoji bob">🛋️</div><h2>You're in the Waiting Room!</h2><p>${nm(s.host)} will start the game soon. Grab a plate 🍽️</p></div>`;
+    const codeCard = `<div class="card center">
         <div class="tiny" style="color:var(--muted)">ROOM CODE</div>
         <div class="roomcode">${esc(room)}</div>
         <div class="mt"><span class="qr">${qr}</span></div>
         <p class="tiny" style="color:var(--muted)">Scan, or send the link to anyone joining from far away 💌</p>
         <button class="btn green" id="share">📲 Send invite link</button>
-      </div>
+      </div>`;
+    return { html: `
+      <div class="center"><div class="logo">Fibsgiving</div><p class="tag">Draw it. Fib it. Find the truth.</p></div>
+      ${waitCard}
+      ${host || spectator ? codeCard : ''}
       <div class="card">
-        <div class="row"><h3 class="grow">Players (<span id="lobbycount">${s.order.length}</span>)</h3></div>
+        <div class="row"><h3 class="grow">🛋️ In the Waiting Room (<span id="lobbycount">${s.order.length}</span>)</h3></div>
         <div id="plist" class="plist"></div>
         <p class="tiny" style="color:var(--muted)">${host ? 'Tap a player to crown them 👑 <b>Guest of Honor</b> — their hearts are worth triple.' : '👑 = Guest of Honor'}</p>
       </div>
@@ -831,7 +843,7 @@ const VIEWS = {
       </div>
       ${host ? `<button class="btn" data-host="start" ${s.settings.rounds.length ? '' : 'disabled'}>🍽️ Start the feast!</button>
         ${s.order.length < 3 ? '<p class="center tiny">Best with 3+ players — but you can start anytime.</p>' : ''}`
-      : `<div class="card soft center">Waiting for ${nm(s.host)} to start the feast…</div>`}
+      : (spectator ? '' : codeCard.replace('class="card center"', 'class="card center" style="opacity:.9"'))}
       ${spectator ? '<p class="center tiny">📺 TV mode — this screen just watches.</p>' : ''}`,
       after() { const b = document.getElementById('share'); if (b) b.onclick = () => shareLink(link); }
     };
@@ -848,7 +860,7 @@ const VIEWS = {
     return {
       noReact: true,
       html: `<div class="secret"><small>🤫 Your secret prompt — don't say it out loud!</small>${esc(prompt)}</div>
-        <div class="mt canvas-wrap"><canvas id="pad"></canvas></div>
+        <div class="drawzone sq"><div class="canvas-wrap"><canvas id="pad"></canvas></div></div>
         ${toolsHTML()}
         <button class="btn" id="sendArt">✅ Send my masterpiece</button>`,
       after() { wirePad(600, 600); document.getElementById('sendArt').onclick = () => sendArt(false); }
@@ -958,7 +970,7 @@ const VIEWS = {
       noReact: true,
       html: `<div class="secret"><small>Part ${st + 1} of 3 · secret creature</small>${PARTS[st]} of ${esc(theme)}</div>
         <p class="center tiny">${how}</p>
-        <div class="mt">${strip}<div class="canvas-wrap"><canvas id="pad"></canvas>${guide}</div></div>
+        <div class="drawzone wide">${strip}<div class="canvas-wrap"><canvas id="pad"></canvas>${guide}</div></div>
         ${toolsHTML()}
         <button class="btn" id="sendArt">✅ Send my ${PARTS[st].toLowerCase()}</button>`,
       after() { wirePad(600, 400); document.getElementById('sendArt').onclick = () => sendArt(false); }
