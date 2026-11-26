@@ -16,6 +16,13 @@
 </head>
 <body>
 <div id="app"><div class="center-screen"><div class="big-emoji bob">🦃</div><p>Warming up the oven…</p></div></div>
+<div id="chat" class="chat hidden" role="dialog" aria-label="Family chat">
+  <div class="chat-head"><b>💬 Family Chat</b><button id="chatClose" class="iconbtn" aria-label="Close chat">✕</button></div>
+  <div id="chatList" class="chat-list"></div>
+  <div id="chatQuick" class="chat-quick"></div>
+  <form id="chatForm" class="chat-form" autocomplete="off"><input id="chatIn" maxlength="300" placeholder="Say something to the family…" enterkeyhint="send"><button class="btn small" type="submit">Send</button></form>
+  <div id="chatRO" class="tiny center hidden" style="padding:10px">📺 TV mode is read-only</div>
+</div>
 <div id="fx"></div>
 <div id="toast"></div>
 <script src="vendor/supabase.js"></script>

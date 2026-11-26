@@ -82,8 +82,10 @@ document.addEventListener('pointerdown', () => {
 }, { passive: true });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wake(); if (room) refresh(); } });
 
-function toast(msg, ms = 2400) {
+function toast(msg, ms = 2400, onTap = null) {
   const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
+  t.onclick = onTap ? () => { t.classList.remove('show'); onTap(); } : null;
+  t.style.cursor = onTap ? 'pointer' : '';
   clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), ms);
 }
 function confetti(n = 80) {
@@ -224,6 +226,7 @@ function subscribe() {
   channel = sb.channel('room:' + room, { config: { presence: { key: me.id }, broadcast: { self: true } } })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: 'code=eq.' + room }, p => onRoomRow(p.new, true))
     .on('postgres_changes', { event: '*', schema: 'public', table: 'moves', filter: 'room=eq.' + room }, p => onMoveRow(p.new))
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat', filter: 'room=eq.' + room }, p => { addMsg(p.new, true); renderChat(); patchLive(); })
     .on('broadcast', { event: 'react' }, ({ payload }) => showReact(payload))
     .on('presence', { event: 'sync' }, () => {
       online = new Set(Object.keys(channel.presenceState()));
@@ -233,7 +236,7 @@ function subscribe() {
       if (amHost()) hostKick();
     })
     .subscribe(async status => {
-      if (status === 'SUBSCRIBED') { await channel.track({ spectator, t: Date.now() }); refresh(); }
+      if (status === 'SUBSCRIBED') { await channel.track({ spectator, t: Date.now() }); refresh(); loadChat(); }
     });
 }
 
@@ -620,6 +623,80 @@ async function failoverCheck() {
   if (ok) { toast('📡 The host dropped — you are now hosting!', 3500); await fetchMoves(0, ['join']); await fetchMoves(state.rc); hostKick(); }
 }
 
+// ---------- family chat ----------
+const chat = { msgs: [], ids: new Set(), open: false, unread: 0, lastSend: 0, sending: false };
+const QUICK = ['😂😂😂', 'Wish you were here! ❤️', 'Who drew that?! 🤣', 'Genius 🧠', 'Gobble gobble 🦃', 'Love you all 🧡'];
+async function loadChat() {
+  if (!room) return;
+  const { data, error } = await sb.from('chat').select('id,pid,name,avatar,text,created_at').eq('room', room).order('id', { ascending: false }).limit(150);
+  if (error || !data) return;
+  for (const m of data.reverse()) addMsg(m, false);
+  renderChat(); patchLive();
+}
+function addMsg(m, live) {
+  if (!m || !m.id || chat.ids.has(m.id)) return;
+  chat.ids.add(m.id); chat.msgs.push(m);
+  if (chat.msgs.length > 1 && m.id < chat.msgs[chat.msgs.length - 2].id) chat.msgs.sort((a, b) => a.id - b.id);
+  if (live && m.pid !== me.id) {
+    SFX.pop();
+    if (!chat.open) { chat.unread++; toast(`💬 ${m.avatar} ${m.name}: ${m.text}`.slice(0, 90), 3500, () => openChat(true)); }
+  }
+}
+function chatTime(iso) { try { return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (e) { return ''; } }
+function renderChat() {
+  const list = document.getElementById('chatList'); if (!list) return;
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+  const vip = state && vipPid(state);
+  list.innerHTML = chat.msgs.length ? chat.msgs.map(m => {
+    const mineMsg = m.pid === me.id, isVip = m.pid === vip;
+    return `<div class="msg${mineMsg ? ' me' : ''}${isVip ? ' vip' : ''}">${mineMsg ? '' : `<span class="mav">${esc(m.avatar)}</span>`}
+      <div class="bub">${mineMsg ? '' : `<div class="who">${esc(m.name)}${isVip ? ' 👑' : ''}</div>`}${esc(m.text)}<div class="ts">${chatTime(m.created_at)}</div></div></div>`;
+  }).join('') : '<div class="center tiny" style="padding:30px 10px">No messages yet — say hi to the family! 👋</div>';
+  if (nearBottom || chat.forceBottom) { list.scrollTop = list.scrollHeight; chat.forceBottom = false; }
+}
+function fitChat() {
+  const el = document.getElementById('chat'), vv = window.visualViewport;
+  if (!el || !vv) return;
+  el.style.top = (vv.offsetTop + 8) + 'px';
+  el.style.height = Math.min(vv.height - 16, window.innerHeight * 0.85) + 'px';
+}
+if (window.visualViewport) { visualViewport.addEventListener('resize', fitChat); visualViewport.addEventListener('scroll', fitChat); }
+function openChat(open) {
+  const el = document.getElementById('chat');
+  chat.open = open; el.classList.toggle('hidden', !open);
+  if (open) {
+    chat.unread = 0; chat.forceBottom = true; fitChat(); renderChat(); patchLive();
+    const canSend = !spectator && joined();
+    document.getElementById('chatForm').classList.toggle('hidden', !canSend);
+    document.getElementById('chatQuick').classList.toggle('hidden', !canSend);
+    document.getElementById('chatRO').classList.toggle('hidden', canSend);
+  }
+}
+async function sendChat(text) {
+  text = String(text || '').trim().slice(0, 300);
+  if (!text || !room || !joined() || chat.sending) return false;
+  if (Date.now() - chat.lastSend < 700) return false;
+  chat.lastSend = Date.now(); chat.sending = true;
+  const pl = state.players[me.id];
+  try {
+    const { data, error } = await sb.from('chat').insert({ room, pid: me.id, name: pl.name.slice(0, 20), avatar: pl.avatar, text }).select('id,pid,name,avatar,text,created_at').single();
+    if (error) { toast('Message didn’t send — try again'); return false; }
+    chat.forceBottom = true; addMsg(data, false); renderChat(); SFX.send();
+    return true;
+  } finally { chat.sending = false; }
+}
+(function wireChat() {
+  document.getElementById('chatClose').onclick = () => openChat(false);
+  document.getElementById('chatQuick').innerHTML = QUICK.map(q => `<button type="button" data-q="${esc(q)}">${esc(q)}</button>`).join('');
+  document.getElementById('chatQuick').querySelectorAll('[data-q]').forEach(b => b.onclick = () => sendChat(b.dataset.q));
+  document.getElementById('chatForm').onsubmit = async e => {
+    e.preventDefault();
+    const inp = document.getElementById('chatIn');
+    if (await sendChat(inp.value)) inp.value = '';
+  };
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && chat.open) openChat(false); });
+})();
+
 // ---------- reactions ----------
 let lastReact = 0;
 function sendReact(e) {
@@ -796,6 +873,7 @@ function shell(main, opts = {}) {
       <span class="chip code">${esc(room)}</span>
       <span class="chip">${esc(roundLabel())}</span>
       <span class="timer hidden" id="timer"></span>
+      <button class="iconbtn chatbtn" id="chatBtn" aria-label="Family chat">💬<span class="badge hidden" id="chatBadge"></span></button>
       <button class="iconbtn" id="mute" aria-label="Sound">${muted ? '🔇' : '🔊'}</button>
     </div>
     <div id="hostctl"></div>
@@ -830,6 +908,7 @@ function wireCommon() {
   const m = document.getElementById('mute');
   if (m) m.onclick = () => { muted = !muted; LS.set('fg_mute', muted); m.textContent = muted ? '🔇' : '🔊'; if (!muted) SFX.ding(); };
   $app.querySelectorAll('[data-react]').forEach(b => b.onclick = () => sendReact(b.dataset.react));
+  const cb = document.getElementById('chatBtn'); if (cb) cb.onclick = () => openChat(true);
   $app.querySelectorAll('[data-host]').forEach(b => b.onclick = () => hostActions[b.dataset.host](b.dataset.arg));
 }
 
@@ -893,6 +972,8 @@ function patchLive() {
     if (p && p.img) { if (img.getAttribute('src') !== p.img) img.src = p.img; }
     else wantPayload(key);
   });
+  const badge = document.getElementById('chatBadge');
+  if (badge) { badge.textContent = chat.unread > 9 ? '9+' : chat.unread; badge.classList.toggle('hidden', !chat.unread); }
   const vc = document.getElementById('lobbycount');
   if (vc) vc.textContent = state.order.length;
 }
@@ -1276,6 +1357,8 @@ async function showGallery(code) {
     const steps = fr.map(x => { const p = mcache.get(mkey('chain', cv.r, cv.c + ':' + x.t, x.pid)); return p && p.img ? `<img alt="" src="${p.img}" style="width:${100 / fr.length}%;display:inline-block;border-right:2px solid #eee">` : ''; }).join('');
     return `<div class="art">${im}<div style="line-height:0;background:#f4e3cc">${steps}</div><div class="cap"><b>${cv.win ? '🏆 Family favorite' : 'Relay masterpiece'}</b><span>${[...new Set(fr.map(x => x.pid))].map(nm).join(' → ')}</span></div></div>`;
   }).join('');
+  const { data: chatLog } = await sb.from('chat').select('id,pid,name,avatar,text,created_at').eq('room', code).order('id', { ascending: true }).limit(500);
+  const chatHTML = (chatLog || []).map(m => `<div class="msg"><span class="mav">${esc(m.avatar)}</span><div class="bub"><div class="who">${esc(m.name)}</div>${esc(m.text)}<div class="ts">${chatTime(m.created_at)}</div></div></div>`).join('');
   const notes = [];
   for (const [key, p] of mcache) if (key.startsWith('thanks|') && p.text) notes.push([key.split('|')[3], p.text]);
   $app.innerHTML = `<div class="center"><div class="logo">Keepsake Gallery</div><p class="tag">Fibsgiving · room ${esc(code)} · ${new Date(row.state.at || Date.now()).toLocaleDateString()}</p>
@@ -1284,7 +1367,8 @@ async function showGallery(code) {
     ${relays ? `<h2 class="mt">🔄 Pass the Canvas</h2><div class="gal">${relays}</div>` : ''}
     ${mons ? `<h2 class="mt">🧟 Frankenfeast Creatures</h2><div class="gal">${mons}</div>` : ''}
     ${notes.length ? `<h2 class="mt">🧡 The Thankful Wall</h2><div class="gal">${notes.map(([p, t]) => `<div class="note">${esc(t).replace(/\n/g, '<br>')}<div class="from">— ${nm(p)}</div></div>`).join('')}</div>` : ''}
-    ${!arts && !mons && !relays && !notes.length ? '<div class="card soft center">Nothing here yet — go play a round!</div>' : ''}
+    ${chatHTML ? `<h2 class="mt">💬 Family Chat from the Night</h2><div class="card chat-log">${chatHTML}</div>` : ''}
+    ${!arts && !mons && !relays && !notes.length && !chatHTML ? '<div class="card soft center">Nothing here yet — go play a round!</div>' : ''}
     <p class="center mt"><a class="btn small ghost" href="?room=${esc(code)}" style="text-decoration:none">← Back to the game</a></p>`;
 }
 
@@ -1315,7 +1399,7 @@ setInterval(() => {
 setInterval(() => { if (room && state && document.visibilityState === 'visible') fetchRoom(room).then(r => r && onRoomRow(r, false)).catch(() => {}); }, 8000);
 
 // ---------- boot ----------
-window.__fg = { get state() { return state; }, get me() { return me; }, get pad() { return pad; }, hostActions, submit, keys, mcache, get online() { return online; } };
+window.__fg = { chat, sendChat, get state() { return state; }, get me() { return me; }, get pad() { return pad; }, hostActions, submit, keys, mcache, get online() { return online; } };
 if (params.get('gallery')) showGallery(params.get('gallery').toUpperCase());
 else {
   const code = (params.get('room') || '').toUpperCase();
